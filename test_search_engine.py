@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from search_engine import LocalSearchEngine, normalize_url
+from search_engine import Crawler, LocalSearchEngine, normalize_url
 
 
 class SearchEngineTests(unittest.TestCase):
@@ -45,6 +45,15 @@ class SearchEngineTests(unittest.TestCase):
         self.assertEqual(fallback[0].title, "Astronomy")
         # Operators and punctuation are tokenized rather than executed as FTS syntax.
         self.assertEqual(self.engine.search('" OR *', record_history=False), [])
+
+    def test_crawler_blocks_private_networks_and_out_of_scope_hosts(self):
+        crawler = Crawler(self.engine, max_pages=3, same_host=True)
+        crawler._seed_hosts = {"example.com"}
+        self.assertFalse(crawler._safe_target("http://127.0.0.1/private"))
+        self.assertFalse(crawler._safe_target("http://169.254.169.254/latest"))
+        self.assertFalse(crawler._within_scope("https://other.example/page"))
+        self.assertTrue(crawler._within_scope("https://example.com/page"))
+        self.assertEqual(crawler.max_requests, 12)
 
 
 if __name__ == "__main__":
