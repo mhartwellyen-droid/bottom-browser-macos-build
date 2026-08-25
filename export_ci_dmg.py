@@ -9,6 +9,7 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -32,6 +33,35 @@ def export() -> str:
     if len(matches) != 1:
         raise RuntimeError(f"Expected one {architecture} DMG, found {matches}")
     dmg = matches[0]
+    subprocess.run(["hdiutil", "verify", str(dmg)], cwd=ROOT, check=True)
+
+    executable = (
+        ROOT
+        / "dist"
+        / "BottomBrowser.app"
+        / "Contents"
+        / "MacOS"
+        / "BottomBrowser"
+    )
+    smoke_log = ROOT / "dist" / f"smoke-{architecture}.log"
+    with smoke_log.open("wb") as log:
+        process = subprocess.Popen(
+            [str(executable)],
+            cwd=ROOT,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+        )
+        time.sleep(10)
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Packaged app exited during smoke test; see {smoke_log}"
+            )
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
     with tempfile.TemporaryDirectory(prefix="bottom-browser-dmg-") as temp:
         staging = Path(temp) / "dmg"
