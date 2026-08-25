@@ -737,7 +737,7 @@ class BrowserWindow(QMainWindow):
             return
         if self.search_crawler and self.search_crawler.running:
             self.search_crawler.stop()
-            self.search_crawler.join(2)
+            self.search_crawler.join()
         self.search_engine.clear_index()
         self.search_engine.seed_starter_corpus(
             resource_path("starter_corpus.json")
@@ -750,7 +750,7 @@ class BrowserWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt API)
         if self.search_crawler and self.search_crawler.running:
             self.search_crawler.stop()
-            self.search_crawler.join(2)
+            self.search_crawler.join()
         self.search_engine.close()
         super().closeEvent(event)
 
