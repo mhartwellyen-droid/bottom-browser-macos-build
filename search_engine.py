@@ -10,9 +10,11 @@ caller's/UI thread.  All functionality uses the Python standard library.
 from __future__ import annotations
 
 import html
+import ipaddress
 import json
 import math
 import re
+import socket
 import sqlite3
 import threading
 import time
@@ -21,8 +23,9 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.error import HTTPError
 from urllib.parse import urljoin, urldefrag, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.robotparser import RobotFileParser
 
 USER_AGENT = "BottomSearchBot/1.0 (+local Bottom Browser search)"
@@ -239,16 +242,24 @@ class LocalSearchEngine:
 class Crawler:
     """Small polite crawler; call ``start`` to launch it and ``join`` to await it."""
     def __init__(self, engine: LocalSearchEngine, *, max_pages: int = 20, same_host: bool = False,
-                 timeout: float = 10.0) -> None:
+                 timeout: float = 5.0) -> None:
         self.engine, self.max_pages, self.same_host, self.timeout = engine, max(1, max_pages), same_host, timeout
+        self.max_requests = self.max_pages * 4
+        self.requests = 0
         self.indexed = self.skipped = 0
         self.errors: list[str] = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._robots: dict[str, RobotFileParser] = {}
         self._last_request: dict[str, float] = {}
+        self._seed_hosts: set[str] = set()
+        self._opener = build_opener(_SafeRedirectHandler(self._safe_target))
     def start(self, urls: Iterable[str]) -> "Crawler":
         initial = list(urls)
+        self._seed_hosts = {
+            _domain(url) for url in initial
+            if urlsplit(url).scheme.lower() in ("http", "https")
+        }
         self._thread = threading.Thread(target=self._run, args=(initial,), daemon=True, name="BottomSearchCrawler")
         self._thread.start(); return self
     def join(self, timeout: float | None = None) -> bool:
@@ -257,9 +268,48 @@ class Crawler:
     @property
     def running(self) -> bool: return bool(self._thread and self._thread.is_alive())
     def stop(self) -> None: self._stop.set()
+
+    def _within_scope(self, url: str) -> bool:
+        try:
+            normalized = normalize_url(url)
+        except ValueError:
+            return False
+        host = _domain(normalized)
+        return bool(host) and (not self.same_host or host in self._seed_hosts)
+
+    def _safe_target(self, url: str) -> bool:
+        """Allow only scoped public-network HTTP(S) destinations."""
+        if not self._within_scope(url):
+            return False
+        parsed = urlsplit(url)
+        try:
+            addresses = {
+                item[4][0]
+                for item in socket.getaddrinfo(
+                    parsed.hostname,
+                    parsed.port or (443 if parsed.scheme == "https" else 80),
+                    type=socket.SOCK_STREAM,
+                )
+            }
+        except (OSError, ValueError):
+            return False
+        if not addresses:
+            return False
+        return all(ipaddress.ip_address(address).is_global for address in addresses)
+
+    def _open(self, request: Request):
+        if self._stop.is_set():
+            raise RuntimeError("crawl cancelled")
+        if self.requests >= self.max_requests:
+            raise RuntimeError("crawl request budget exhausted")
+        if not self._safe_target(request.full_url):
+            raise ValueError("blocked non-public or out-of-scope URL")
+        self.requests += 1
+        return self._opener.open(request, timeout=self.timeout)
+
     def _allowed(self, url: str) -> tuple[bool, float]:
         p = urlsplit(url); host = p.netloc
-        if p.scheme not in ("http", "https") or p.path.lower().endswith(tuple(BAD_EXTENSIONS)): return False, 0
+        if not self._safe_target(url) or p.path.lower().endswith(tuple(BAD_EXTENSIONS)): return False, 0
         rp = self._robots.get(host)
         if rp is None:
             rp = RobotFileParser(); rp.set_url(f"{p.scheme}://{host}/robots.txt")
@@ -267,47 +317,75 @@ class Crawler:
                 # RobotFileParser.read cannot set a user agent. Fetch explicitly
                 # so every HTTP request identifies this crawler consistently.
                 request = Request(rp.url, headers={"User-Agent": USER_AGENT})
-                with urlopen(request, timeout=self.timeout) as response:
-                    if response.status >= 400:
-                        rp.parse(["User-agent: *", "Allow: /"])
-                    else:
-                        rp.parse(response.read(256_000).decode(
-                            response.headers.get_content_charset() or "utf-8", "replace"
-                        ).splitlines())
+                with self._open(request) as response:
+                    rp.parse(response.read(256_000).decode(
+                        response.headers.get_content_charset() or "utf-8", "replace"
+                    ).splitlines())
+            except HTTPError as exc:
+                if exc.code in (404, 410):
+                    rp.parse(["User-agent: *", "Allow: /"])
+                else:
+                    rp.parse(["User-agent: *", "Disallow: /"])
             except Exception:
-                # An unavailable robots file is treated as no published policy;
-                # a response that explicitly disallows this bot is never ignored.
-                rp.parse(["User-agent: *", "Allow: /"])
+                # Fail closed when a published policy cannot be checked.
+                rp.parse(["User-agent: *", "Disallow: /"])
             self._robots[host] = rp
             self._last_request[host] = time.monotonic()
         return rp.can_fetch(USER_AGENT, url), (rp.crawl_delay(USER_AGENT) or rp.crawl_delay("*") or 1.0)
-    def _fetch(self, url: str, delay: float) -> tuple[str, str] | None:
+
+    def _fetch(self, url: str, delay: float) -> tuple[str, str, bool] | None:
         host = urlsplit(url).netloc; wait = delay - (time.monotonic() - self._last_request.get(host, 0))
-        if wait > 0: time.sleep(wait)
+        if wait > 0 and self._stop.wait(wait):
+            return None
         self._last_request[host] = time.monotonic()
         req = Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"})
-        with urlopen(req, timeout=self.timeout) as response:
+        with self._open(req) as response:
+            final_url = response.geturl()
+            if not self._safe_target(final_url):
+                raise ValueError("redirect escaped crawler scope")
             if "html" not in response.headers.get_content_type(): return None
+            noindex = "noindex" in response.headers.get(
+                "X-Robots-Tag", ""
+            ).lower()
             raw = response.read(MAX_PAGE_BYTES + 1)
             if len(raw) > MAX_PAGE_BYTES: return None
-            return response.geturl(), raw.decode(response.headers.get_content_charset() or "utf-8", "replace")
+            return (
+                normalize_url(final_url),
+                raw.decode(
+                    response.headers.get_content_charset() or "utf-8",
+                    "replace",
+                ),
+                noindex,
+            )
+
     def _run(self, initial: list[str]) -> None:
         queue, seen = list(initial), set()
-        seed_hosts = {_domain(u) for u in initial if urlsplit(u).scheme in ("http", "https")}
-        while queue and self.indexed < self.max_pages and not self._stop.is_set():
+        while (
+            queue
+            and self.indexed < self.max_pages
+            and self.requests < self.max_requests
+            and not self._stop.is_set()
+        ):
             raw = queue.pop(0)
             try: url = normalize_url(raw)
             except ValueError: self.skipped += 1; continue
-            if url in seen or (self.same_host and _domain(url) not in seed_hosts): self.skipped += 1; continue
+            if url in seen or not self._within_scope(url): self.skipped += 1; continue
             seen.add(url)
             allowed, delay = self._allowed(url)
             if not allowed: self.skipped += 1; continue
             try: fetched = self._fetch(url, delay)
             except Exception as exc: self.errors.append(f"{url}: {exc}"); continue
             if not fetched: self.skipped += 1; continue
-            final_url, page = fetched; parser = _PageParser(); parser.feed(page)
+            final_url, page, header_noindex = fetched; parser = _PageParser(); parser.feed(page)
             canonical = urljoin(final_url, parser.canonical) if parser.canonical else final_url
-            if not parser.noindex and parser.text:
+            if not self._within_scope(canonical):
+                canonical = final_url
+            if (
+                not self._stop.is_set()
+                and not header_noindex
+                and not parser.noindex
+                and parser.text
+            ):
                 try:
                     self.engine.upsert_document(canonical, parser.title.strip() or canonical,
                         " ".join(parser.text), description=parser.description, source="crawler")
@@ -315,4 +393,23 @@ class Crawler:
                 except ValueError: self.skipped += 1
             for link in parser.links:
                 candidate = urldefrag(urljoin(final_url, link))[0]
-                if candidate not in seen and len(queue) < self.max_pages * 20: queue.append(candidate)
+                if (
+                    self._within_scope(candidate)
+                    and candidate not in seen
+                    and len(queue) < self.max_pages * 5
+                ):
+                    queue.append(candidate)
+
+
+class _SafeRedirectHandler(HTTPRedirectHandler):
+    """Reject redirects before urllib opens an unsafe destination."""
+
+    def __init__(self, validator) -> None:
+        super().__init__()
+        self.validator = validator
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urljoin(req.full_url, newurl)
+        if not self.validator(target):
+            raise ValueError("redirect blocked by crawler network policy")
+        return super().redirect_request(req, fp, code, msg, headers, target)
