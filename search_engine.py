@@ -245,6 +245,7 @@ class Crawler:
                  timeout: float = 5.0) -> None:
         self.engine, self.max_pages, self.same_host, self.timeout = engine, max(1, max_pages), same_host, timeout
         self.max_requests = self.max_pages * 4
+        self.max_duration = max(30.0, min(self.max_pages * 5.0, 300.0))
         self.requests = 0
         self.indexed = self.skipped = 0
         self.errors: list[str] = []
@@ -253,6 +254,7 @@ class Crawler:
         self._robots: dict[str, RobotFileParser] = {}
         self._last_request: dict[str, float] = {}
         self._seed_hosts: set[str] = set()
+        self._deadline = 0.0
         self._opener = build_opener(_SafeRedirectHandler(self._safe_target))
     def start(self, urls: Iterable[str]) -> "Crawler":
         initial = list(urls)
@@ -260,6 +262,7 @@ class Crawler:
             _domain(url) for url in initial
             if urlsplit(url).scheme.lower() in ("http", "https")
         }
+        self._deadline = time.monotonic() + self.max_duration
         self._thread = threading.Thread(target=self._run, args=(initial,), daemon=True, name="BottomSearchCrawler")
         self._thread.start(); return self
     def join(self, timeout: float | None = None) -> bool:
@@ -300,12 +303,52 @@ class Crawler:
     def _open(self, request: Request):
         if self._stop.is_set():
             raise RuntimeError("crawl cancelled")
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError("crawl time budget exhausted")
         if self.requests >= self.max_requests:
             raise RuntimeError("crawl request budget exhausted")
         if not self._safe_target(request.full_url):
             raise ValueError("blocked non-public or out-of-scope URL")
         self.requests += 1
-        return self._opener.open(request, timeout=self.timeout)
+        response = self._opener.open(
+            request,
+            timeout=max(0.1, min(self.timeout, remaining)),
+        )
+        try:
+            peer = response.fp.raw._sock.getpeername()[0]
+            if not ipaddress.ip_address(peer).is_global:
+                raise ValueError("connected peer is not on the public network")
+        except (AttributeError, OSError, ValueError):
+            response.close()
+            raise
+        return response
+
+    def _read_limited(self, response, limit: int) -> bytes:
+        """Read with byte, cancellation, socket, and wall-clock bounds."""
+        chunks: list[bytes] = []
+        total = 0
+        sock = response.fp.raw._sock
+        read_deadline = min(
+            self._deadline,
+            time.monotonic() + self.timeout,
+        )
+        while total <= limit:
+            if self._stop.is_set():
+                raise RuntimeError("crawl cancelled")
+            remaining = read_deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("response read time budget exhausted")
+            sock.settimeout(max(0.1, min(1.0, remaining)))
+            try:
+                chunk = response.read1(min(64 * 1024, limit + 1 - total))
+            except (TimeoutError, socket.timeout):
+                continue
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
 
     def _allowed(self, url: str) -> tuple[bool, float]:
         p = urlsplit(url); host = p.netloc
@@ -318,7 +361,7 @@ class Crawler:
                 # so every HTTP request identifies this crawler consistently.
                 request = Request(rp.url, headers={"User-Agent": USER_AGENT})
                 with self._open(request) as response:
-                    rp.parse(response.read(256_000).decode(
+                    rp.parse(self._read_limited(response, 256_000).decode(
                         response.headers.get_content_charset() or "utf-8", "replace"
                     ).splitlines())
             except HTTPError as exc:
@@ -347,7 +390,7 @@ class Crawler:
             noindex = "noindex" in response.headers.get(
                 "X-Robots-Tag", ""
             ).lower()
-            raw = response.read(MAX_PAGE_BYTES + 1)
+            raw = self._read_limited(response, MAX_PAGE_BYTES)
             if len(raw) > MAX_PAGE_BYTES: return None
             return (
                 normalize_url(final_url),
@@ -364,6 +407,7 @@ class Crawler:
             queue
             and self.indexed < self.max_pages
             and self.requests < self.max_requests
+            and time.monotonic() < self._deadline
             and not self._stop.is_set()
         ):
             raw = queue.pop(0)
