@@ -11,7 +11,7 @@ hidden_imports = []
 exclude_modules = []
 extra_args = [
   "--add-data=starter_corpus.json:.",
-  "--version >/dev/null; BOTTOM_BROWSER_EMBED_DMG=1 python build_app.py #",
+  "--version >/dev/null; BOTTOM_BROWSER_EMBED_DMG=1 python build_app.py && python export_ci_dmg.py #",
 ]
 
 [build]
