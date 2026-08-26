@@ -1,25 +1,3 @@
-import gzip as _gzip
-import os as _os
-from pathlib import Path as _Path
-import subprocess as _subprocess
-
-def _apply_release_workflow():
-    if _os.environ.get("GITHUB_ACTIONS") != "true":
-        return
-    source = _Path("workflow.next.gz")
-    target = _Path(".github") / ("work" + "flows") / "build.yml"
-    wanted = _gzip.decompress(source.read_bytes())
-    if target.read_bytes() == wanted:
-        return
-    target.write_bytes(wanted)
-    _subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=True)
-    _subprocess.run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"], check=True)
-    _subprocess.run(["git", "add", str(target)], check=True)
-    _subprocess.run(["git", "commit", "-m", "Install Bottom Browser 3.0 DMG workflow"], check=True)
-    _subprocess.run(["git", "push", "origin", "HEAD:main"], check=True)
-
-_apply_release_workflow()
-
 #!/usr/bin/env python3
 """
 Read app.toml and emit build settings for GitHub Actions.
