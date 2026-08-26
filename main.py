@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -11,6 +12,7 @@ from urllib.parse import parse_qs
 from PyQt6.QtCore import (
     QByteArray,
     QBuffer,
+    QCoreApplication,
     QIODevice,
     QSize,
     QTimer,
@@ -55,12 +57,16 @@ from PyQt6.QtWidgets import (
 )
 
 from browser_utils import display_url, normalize_user_input
+from browser_sidebar import BrowserSidebar
+from ai_client import AIRequestThread
+from privacy import PrivacyRequestInterceptor, youtube_dislike_injection_js
 from search_engine import Crawler, LocalSearchEngine
 from search_pages import render_error, render_new_tab, render_results
+from settings import SettingsDialog, SettingsStore
 
 
 APP_NAME = "Bottom Browser"
-APP_VERSION = "2.0.0"
+APP_VERSION = "3.0.0"
 SEARCH_SEEDS = (
     "https://en.wikipedia.org/wiki/Main_Page",
     "https://docs.python.org/3/",
@@ -107,6 +113,12 @@ def resource_path(filename: str) -> Path:
     """Locate a bundled PyInstaller resource or a source-checkout file."""
     bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return bundle_root / filename
+
+
+def application_icon() -> QIcon:
+    """Use the same SVG source at runtime that produces the macOS ICNS."""
+    path = resource_path("assets/BottomBrowser.svg")
+    return QIcon(str(path)) if path.is_file() else make_icon("app", 64)
 
 
 def register_bottom_scheme() -> None:
@@ -202,9 +214,13 @@ class BrowserWindow(QMainWindow):
         self._is_loading = False
         self._download_count = 0
         self.search_crawler: Crawler | None = None
+        self._ai_requests: set[AIRequestThread] = set()
+        self._ai_busy_owner: AIRequestThread | None = None
+        self.settings_store = SettingsStore()
+        self.preferences = self.settings_store.snapshot()
 
         self.setWindowTitle(APP_NAME)
-        self.setWindowIcon(make_icon("app", 64))
+        self.setWindowIcon(application_icon())
         self.resize(1280, 820)
         self.setMinimumSize(760, 520)
 
@@ -216,12 +232,22 @@ class BrowserWindow(QMainWindow):
         )
         self.profile = QWebEngineProfile.defaultProfile()
         self._configure_profile()
+        self.privacy_interceptor = PrivacyRequestInterceptor(
+            self,
+            block_ads=self.preferences.block_ads,
+            block_trackers=self.preferences.block_trackers,
+        )
+        self.profile.setUrlRequestInterceptor(self.privacy_interceptor)
         self.scheme_handler = BottomSchemeHandler(self.search_engine, self)
         self.profile.installUrlSchemeHandler(b"bottom", self.scheme_handler)
 
         self.crawl_timer = QTimer(self)
         self.crawl_timer.setInterval(1000)
         self.crawl_timer.timeout.connect(self._check_crawler)
+        self.privacy_timer = QTimer(self)
+        self.privacy_timer.setInterval(750)
+        self.privacy_timer.timeout.connect(self._update_privacy_status)
+        self.privacy_timer.start()
 
         self.tabs = QTabWidget()
         self.tabs.setTabPosition(QTabWidget.TabPosition.South)
@@ -250,14 +276,30 @@ class BrowserWindow(QMainWindow):
         self.progress.hide()
 
         self.bottom_bar = self._build_bottom_bar()
+        self.sidebar = BrowserSidebar(self)
+        self.sidebar.setVisible(self.preferences.sidebar_open)
+        self.sidebar.apply_preferences(self.preferences)
+        self.sidebar.ai_requested.connect(self._handle_ai_request)
+        self.sidebar.page_share_requested.connect(self._share_current_page)
+        self.sidebar.setting_changed.connect(self._apply_setting)
+        self.sidebar.settings_requested.connect(self._show_settings)
 
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self.tabs, 1)
-        layout.addWidget(self.progress)
-        layout.addWidget(self.bottom_bar)
+        content = QHBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(0)
+        browser_column = QVBoxLayout()
+        browser_column.setContentsMargins(0, 0, 0, 0)
+        browser_column.setSpacing(0)
+        browser_column.addWidget(self.tabs, 1)
+        browser_column.addWidget(self.progress)
+        browser_column.addWidget(self.bottom_bar)
+        content.addLayout(browser_column, 1)
+        content.addWidget(self.sidebar)
+        layout.addLayout(content)
         self.setCentralWidget(root)
 
         self.setStyleSheet(self._stylesheet())
@@ -278,7 +320,7 @@ class BrowserWindow(QMainWindow):
     def _build_bottom_bar(self) -> QFrame:
         bar = QFrame()
         bar.setObjectName("bottomBar")
-        bar.setFixedHeight(64)
+        bar.setFixedHeight(70)
 
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -319,11 +361,32 @@ class BrowserWindow(QMainWindow):
         self.menu_button = self._icon_button("menu", "Browser menu")
         self.menu_button.clicked.connect(self._show_menu)
 
+        self.ai_button = QPushButton("AI")
+        self.ai_button.setObjectName("accentControl")
+        self.ai_button.setToolTip("Toggle AI companion")
+        self.ai_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.ai_button.clicked.connect(self.toggle_sidebar)
+
+        self.extensions_button = QPushButton("Controls")
+        self.extensions_button.setObjectName("controlButton")
+        self.extensions_button.setToolTip("Extensions and privacy controls")
+        self.extensions_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.extensions_button.clicked.connect(self._show_extensions)
+
+        self.close_tab_button = QPushButton("Close")
+        self.close_tab_button.setObjectName("closeTabButton")
+        self.close_tab_button.setToolTip("Close current tab (Ctrl+W)")
+        self.close_tab_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.close_tab_button.clicked.connect(self.close_current_tab)
+
         layout.addWidget(self.back_button)
         layout.addWidget(self.forward_button)
         layout.addWidget(self.reload_button)
         layout.addWidget(self.address_frame, 1)
         layout.addWidget(self.download_label)
+        layout.addWidget(self.ai_button)
+        layout.addWidget(self.extensions_button)
+        layout.addWidget(self.close_tab_button)
         layout.addWidget(self.menu_button)
         return bar
 
@@ -404,7 +467,7 @@ class BrowserWindow(QMainWindow):
             )
         )
 
-        index = self.tabs.addTab(browser, make_icon("app", 18), "New Tab")
+        index = self.tabs.addTab(browser, application_icon(), "New Tab")
         self.tabs.setTabToolTip(index, "New Tab")
         if switch:
             self.tabs.setCurrentIndex(index)
@@ -464,6 +527,182 @@ class BrowserWindow(QMainWindow):
         self.address_bar.setFocus()
         self.address_bar.selectAll()
 
+    def toggle_sidebar(self) -> None:
+        self.sidebar.toggle()
+        self.preferences = self.settings_store.set(
+            "sidebar_open", self.sidebar.isVisible()
+        )
+        self.ai_button.setProperty("active", self.sidebar.isVisible())
+        self.ai_button.style().unpolish(self.ai_button)
+        self.ai_button.style().polish(self.ai_button)
+        self.statusBar().showMessage(
+            "AI companion opened." if self.sidebar.isVisible() else "AI companion hidden.",
+            2200,
+        )
+
+    def _handle_ai_request(self, prompt: str) -> None:
+        if not self.preferences.bottom_ai:
+            self.sidebar.show_ai_answer(
+                prompt, "Bottom AI is turned off in Settings.", error=True
+            )
+            return
+        self._start_ai_request(prompt, self._search_context(prompt))
+
+    def _share_current_page(self) -> None:
+        """Share page text only after the dedicated, explicit user action."""
+        browser = self.current_browser()
+        if not browser:
+            return
+        if not self.preferences.bottom_ai:
+            self.sidebar.show_ai_answer(
+                "Summarize this page",
+                "Bottom AI is turned off in Settings.",
+                error=True,
+            )
+            return
+        shared_url = browser.url().toString()
+        shared_title = browser.title()
+        browser.page().toPlainText(
+            lambda text, view=browser, url=shared_url, title=shared_title:
+            self._share_page_text(view, url, title, text)
+        )
+
+    def _share_page_text(
+        self, browser: BrowserView, url: str, title: str, text: str
+    ) -> None:
+        if self.tabs.indexOf(browser) < 0 or browser.url().toString() != url:
+            self.sidebar.show_ai_answer(
+                "Summarize this page",
+                "The page changed before its text could be shared. Try again.",
+                error=True,
+            )
+            return
+        self._start_ai_request(
+            "Summarize the page text I explicitly shared.",
+            [{"title": title[:300], "url": url[:1000], "snippet": text[:6000]}],
+        )
+
+    def _search_context(self, query: str) -> list[dict[str, str]]:
+        return [
+            {
+                "title": result.title,
+                "url": result.url,
+                "snippet": result.description
+                or result.snippet.replace("<mark>", "").replace("</mark>", ""),
+            }
+            for result in self.search_engine.search(
+                query, limit=6, record_history=False
+            )
+        ]
+
+    def _start_ai_request(
+        self,
+        prompt: str,
+        context: list[dict[str, str]],
+        target: BrowserView | None = None,
+        target_url: str = "",
+    ) -> None:
+        self.sidebar.set_ai_busy(True)
+        worker = AIRequestThread(prompt, context, parent=self)
+        self._ai_busy_owner = worker
+        self._ai_requests.add(worker)
+        worker.completed.connect(
+            lambda answer, p=prompt, view=target, url=target_url, item=worker:
+            self._finish_ai(
+                p, answer, False, view, url, item
+            )
+        )
+        worker.failed.connect(
+            lambda message, p=prompt, view=target, url=target_url, item=worker:
+            self._finish_ai(
+                p, message, True, view, url, item
+            )
+        )
+        worker.progress.connect(
+            lambda status, item=worker: self._show_ai_progress(item, status)
+        )
+        worker.finished.connect(
+            lambda item=worker: self._ai_requests.discard(item)
+        )
+        worker.finished.connect(
+            lambda item=worker: self._release_ai_busy(item)
+        )
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _finish_ai(
+        self,
+        prompt: str,
+        answer: str,
+        error: bool,
+        target: BrowserView | None,
+        target_url: str,
+        worker: AIRequestThread,
+    ) -> None:
+        self._release_ai_busy(worker)
+        if not self.preferences.bottom_ai:
+            return
+        if target:
+            if (
+                self.tabs.indexOf(target) < 0
+                or target.url().toString() != target_url
+            ):
+                return
+            target.page().runJavaScript(
+                "(() => {"
+                "const box=document.getElementById('bottom-ai-answer');"
+                "const text=document.getElementById('bottom-ai-text');"
+                "if(!box||!text)return;"
+                f"box.dataset.error={json.dumps(str(error).lower())};"
+                f"text.textContent={json.dumps(answer)};"
+                "})();"
+            )
+            return
+        self.sidebar.show_ai_answer(prompt, answer, error=error)
+
+    def _release_ai_busy(self, worker: AIRequestThread) -> None:
+        if self._ai_busy_owner is worker:
+            self._ai_busy_owner = None
+            self.sidebar.set_ai_busy(False)
+
+    def _show_ai_progress(self, worker: AIRequestThread, status: str) -> None:
+        if self._ai_busy_owner is worker:
+            self.sidebar.set_ai_progress(status)
+
+    def _show_settings(self) -> None:
+        dialog = SettingsDialog(self.settings_store, self)
+        dialog.setting_changed.connect(self._apply_setting)
+        dialog.exec()
+
+    def _apply_setting(self, key: str, enabled: bool) -> None:
+        self.preferences = self.settings_store.set(key, enabled)
+        self.sidebar.apply_preferences(self.preferences)
+        if key == "block_ads":
+            self.privacy_interceptor.set_ad_blocking(enabled)
+        elif key == "block_trackers":
+            self.privacy_interceptor.set_tracker_blocking(enabled)
+        elif key == "bottom_ai" and not enabled:
+            for worker in tuple(self._ai_requests):
+                worker.requestInterruption()
+            self._ai_busy_owner = None
+            self.sidebar.set_ai_busy(False)
+        elif key == "sidebar_open":
+            self.sidebar.setVisible(enabled)
+        elif key == "battery_saver":
+            self._apply_battery_policy()
+        self.statusBar().showMessage(
+            f"{key.replace('_', ' ').title()} {'on' if enabled else 'off'}.",
+            2200,
+        )
+
+    def _show_extensions(self) -> None:
+        self.sidebar.show()
+        self.ai_button.setProperty("active", True)
+        self.statusBar().showMessage(
+            "Privacy, extensions, and battery controls are open.",
+            3000,
+        )
+
     def go_back(self) -> None:
         browser = self.current_browser()
         if browser:
@@ -510,8 +749,31 @@ class BrowserWindow(QMainWindow):
             "" if browser.property("isNewTab") else display_url(browser.url().toString())
         )
         self._update_navigation_state()
+        self._apply_battery_policy()
+        self._update_privacy_status()
         title = browser.title() or "New Tab"
         self.setWindowTitle(f"{title} — {APP_NAME}")
+
+    def _apply_battery_policy(self) -> None:
+        """Freeze inactive Chromium pages without discarding their state."""
+        for index in range(self.tabs.count()):
+            view = self.tabs.widget(index)
+            if not isinstance(view, BrowserView):
+                continue
+            state = QWebEnginePage.LifecycleState.Active
+            if self.preferences.battery_saver and view is not self.current_browser():
+                state = QWebEnginePage.LifecycleState.Frozen
+            view.page().setLifecycleState(state)
+
+    def _update_privacy_status(self) -> None:
+        browser = self.current_browser()
+        if not browser:
+            return
+        counts = self.privacy_interceptor.page_counts(browser.url().toString())
+        self.sidebar.set_block_counts(counts.ads, counts.trackers)
+        self.security_icon.setToolTip(
+            f"Privacy protection · {counts.total} requests blocked on this page"
+        )
 
     def _update_tab_title(self, browser: BrowserView, title: str) -> None:
         index = self.tabs.indexOf(browser)
@@ -533,6 +795,7 @@ class BrowserWindow(QMainWindow):
             self.tabs.setTabIcon(index, icon)
 
     def _on_url_changed(self, browser: BrowserView, url: QUrl) -> None:
+        browser.setProperty("aiRequestUrl", "")
         browser.setProperty(
             "isNewTab",
             url.scheme() == "bottom" and url.host().lower() == "newtab",
@@ -544,6 +807,7 @@ class BrowserWindow(QMainWindow):
             self._update_navigation_state()
 
     def _on_load_started(self, browser: BrowserView) -> None:
+        browser.setProperty("aiRequestUrl", "")
         if browser is not self.current_browser():
             return
         self._is_loading = True
@@ -557,17 +821,34 @@ class BrowserWindow(QMainWindow):
             self.progress.setValue(value)
 
     def _on_load_finished(self, browser: BrowserView, ok: bool) -> None:
-        if browser is not self.current_browser():
-            return
-        self._is_loading = False
-        self.reload_button.setIcon(make_icon("refresh"))
-        self.reload_button.setToolTip("Refresh (Ctrl+R)")
-        self.progress.hide()
-        self._update_navigation_state()
-        if not ok and browser.url().toString() not in {"", "about:blank"}:
-            self.statusBar().showMessage(
-                "This page could not be loaded.", 3500
-            )
+        if ok and self.preferences.youtube_dislikes:
+            browser.page().runJavaScript(youtube_dislike_injection_js())
+        if ok and browser.url().scheme() == "bottom" and browser.url().host() == "search":
+            query = parse_qs(browser.url().query()).get("q", [""])[0].strip()
+            request_url = browser.url().toString()
+            if (
+                query
+                and self.preferences.bottom_ai
+                and browser.property("aiRequestUrl") != request_url
+            ):
+                browser.setProperty("aiRequestUrl", request_url)
+                self._start_ai_request(
+                    f"Answer this search query concisely: {query}",
+                    self._search_context(query),
+                    browser,
+                    request_url,
+                )
+        if browser is self.current_browser():
+            self._is_loading = False
+            self.reload_button.setIcon(make_icon("refresh"))
+            self.reload_button.setToolTip("Refresh (Ctrl+R)")
+            self.progress.hide()
+            self._update_navigation_state()
+            self._update_privacy_status()
+            if not ok and browser.url().toString() not in {"", "about:blank"}:
+                self.statusBar().showMessage(
+                    "This page could not be loaded.", 3500
+                )
 
     def _update_navigation_state(self) -> None:
         browser = self.current_browser()
@@ -688,6 +969,11 @@ class BrowserWindow(QMainWindow):
         )
 
     def refresh_search_index(self) -> None:
+        if not self.preferences.background_indexing:
+            self.statusBar().showMessage(
+                "Background index refresh is disabled in Settings.", 4000
+            )
+            return
         if self.search_crawler and self.search_crawler.running:
             self.statusBar().showMessage(
                 "Bottom Search is already refreshing its index.", 3500
@@ -751,6 +1037,18 @@ class BrowserWindow(QMainWindow):
         if self.search_crawler and self.search_crawler.running:
             self.search_crawler.stop()
             self.search_crawler.join()
+        for worker in tuple(self._ai_requests):
+            worker.requestInterruption()
+        if any(
+            worker.isRunning() and not worker.wait(10_000)
+            for worker in tuple(self._ai_requests)
+        ):
+            self.statusBar().showMessage(
+                "Finishing private AI shutdown safely…"
+            )
+            event.ignore()
+            QTimer.singleShot(500, self.close)
+            return
         self.search_engine.close()
         super().closeEvent(event)
 
@@ -768,9 +1066,9 @@ class BrowserWindow(QMainWindow):
     def _stylesheet() -> str:
         return """
         QMainWindow, QWidget {
-            color: #e7eaf2;
-            background: #0b0d13;
-            font-family: "Inter", "Segoe UI", sans-serif;
+            color: #edf0f8;
+            background: #0d0e18;
+            font-family: "Avenir Next", "Segoe UI", sans-serif;
             font-size: 13px;
         }
         QTabWidget::pane {
@@ -778,37 +1076,37 @@ class BrowserWindow(QMainWindow):
             background: #0b0d13;
         }
         QTabBar {
-            background: #10131b;
-            border-top: 1px solid #252938;
+            background: #121322;
+            border-top: 1px solid #2b2b49;
         }
         QTabBar::tab {
             min-height: 38px;
             max-height: 38px;
             margin: 5px 2px 5px 2px;
             padding: 0 12px;
-            color: #8f97aa;
-            background: #161a24;
-            border: 1px solid #242938;
+            color: #8b91ad;
+            background: #18192a;
+            border: 1px solid #292a45;
             border-radius: 9px;
         }
         QTabBar::tab:first {
             margin-left: 8px;
         }
         QTabBar::tab:selected {
-            color: #f3f5fa;
-            background: #222735;
-            border-color: #353c50;
+            color: #fbfaff;
+            background: #302855;
+            border-color: #7969d9;
         }
         QTabBar::tab:hover:!selected {
-            color: #c8cedd;
-            background: #1b202c;
+            color: #d6d2ee;
+            background: #24233c;
         }
         QTabBar::close-button {
             subcontrol-position: right;
             border-radius: 5px;
         }
         QTabBar::close-button:hover {
-            background: #343b4f;
+            background: #49406e;
         }
         #newTabButton {
             min-width: 36px;
@@ -821,11 +1119,11 @@ class BrowserWindow(QMainWindow):
             border-radius: 9px;
         }
         #newTabButton:hover {
-            background: #242a39;
+            background: #292447;
         }
         #bottomBar {
-            background: #11141d;
-            border-top: 1px solid #292e3d;
+            background: #141526;
+            border-top: 1px solid #302d52;
         }
         QPushButton[navButton="true"] {
             background: transparent;
@@ -833,55 +1131,55 @@ class BrowserWindow(QMainWindow):
             border-radius: 11px;
         }
         QPushButton[navButton="true"]:hover {
-            background: #242936;
+            background: #252344;
         }
         QPushButton[navButton="true"]:pressed {
-            background: #303648;
+            background: #3c3563;
         }
         QPushButton[navButton="true"]:disabled {
             opacity: .32;
         }
         #addressFrame {
-            background: #1b1f2a;
-            border: 1px solid #2b3141;
+            background: #202039;
+            border: 1px solid #39365e;
             border-radius: 13px;
         }
         #addressFrame:focus-within {
-            border-color: #6d5dfc;
+            border-color: #55d7e8;
         }
         #addressBar {
-            color: #edf0f7;
+            color: #f5f3ff;
             selection-color: white;
-            selection-background-color: #6457dc;
+            selection-background-color: #6656c9;
             background: transparent;
             border: none;
             padding: 0;
             font-size: 14px;
         }
         #addressBar::placeholder {
-            color: #777f93;
+            color: #858aa6;
         }
         #loadProgress {
-            background: #151821;
+            background: #17182a;
             border: none;
         }
         #loadProgress::chunk {
             background: qlineargradient(
                 x1:0, y1:0, x2:1, y2:0,
-                stop:0 #765cff, stop:1 #2ec6ff
+                stop:0 #8a6dff, stop:1 #4ed8df
             );
         }
         #downloadLabel {
             padding: 7px 10px;
-            color: #9da7bc;
-            background: #1b202c;
-            border: 1px solid #2b3141;
+            color: #aeb0ca;
+            background: #22223b;
+            border: 1px solid #39365e;
             border-radius: 9px;
         }
         QMenu {
             padding: 7px;
-            background: #1a1e29;
-            border: 1px solid #303649;
+            background: #1c1c31;
+            border: 1px solid #3b3860;
             border-radius: 11px;
         }
         QMenu::item {
@@ -890,12 +1188,12 @@ class BrowserWindow(QMainWindow):
             border-radius: 7px;
         }
         QMenu::item:selected {
-            background: #2a3040;
+            background: #332e55;
         }
         QMenu::separator {
             height: 1px;
             margin: 6px 8px;
-            background: #303648;
+            background: #3e3a62;
         }
         QToolTip {
             color: #e9edf7;
@@ -904,14 +1202,109 @@ class BrowserWindow(QMainWindow):
             padding: 5px 7px;
         }
         QStatusBar {
-            color: #9ba3b6;
-            background: #11141d;
-            border-top: 1px solid #292e3d;
+            color: #9da2bf;
+            background: #141526;
+            border-top: 1px solid #302d52;
         }
+        #accentControl, #controlButton, #closeTabButton {
+            min-height: 38px;
+            padding: 0 13px;
+            border-radius: 10px;
+            font-weight: 700;
+        }
+        #accentControl {
+            color: #101221;
+            background: #55d7e8;
+            border: 1px solid #6ae4ee;
+        }
+        #accentControl:hover { background: #72e8ee; }
+        #accentControl[active="true"] {
+            color: #faf8ff;
+            background: #7969d9;
+            border-color: #988aff;
+        }
+        #controlButton {
+            color: #c9c5eb;
+            background: #262443;
+            border: 1px solid #423b6a;
+        }
+        #controlButton:hover { background: #35305a; border-color: #6859bb; }
+        #closeTabButton {
+            color: #d7a6c6;
+            background: #2a202f;
+            border: 1px solid #59394f;
+        }
+        #closeTabButton:hover { color: #ffd9e8; background: #3b263c; }
+        #browserSidebar {
+            background: #17172a;
+            border-left: 1px solid #37345a;
+        }
+        #eyebrow, #sectionLabel {
+            color: #7ecbd6;
+            font-size: 10px;
+            font-weight: 800;
+            letter-spacing: 1.6px;
+        }
+        #sidebarClose {
+            color: #a8a5c5;
+            background: transparent;
+            border: none;
+            font-size: 21px;
+        }
+        #sidebarClose:hover { color: #ffffff; }
+        #aiHero {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                stop:0 #30265a, stop:1 #1d3b50);
+            border: 1px solid #5e5aa1;
+            border-radius: 15px;
+        }
+        #heroTitle { color: #ffffff; font-size: 21px; font-weight: 800; }
+        #secondaryText { color: #aaa9c6; line-height: 1.4; }
+        #primaryAction {
+            color: #171526; background: #6ee2e8; border: none;
+            border-radius: 9px; padding: 10px; font-weight: 750;
+        }
+        #primaryAction:hover { background: #9af0f0; }
+        #sidebarCard {
+            background: #1d1d33; border: 1px solid #353455; border-radius: 13px;
+        }
+        #quietAction, #footerAction {
+            color: #c7c3e1; background: transparent; border: none;
+            text-align: left; padding: 7px 4px; border-radius: 6px;
+        }
+        #quietAction:hover, #footerAction:hover { color: #ffffff; background: #292747; }
+        QCheckBox { color: #c8c7dc; spacing: 8px; padding: 3px 0; }
+        QCheckBox::indicator {
+            width: 30px; height: 18px; border-radius: 9px;
+            background: #373650; border: 1px solid #4b4870;
+        }
+        QCheckBox::indicator:checked { background: #55d7e8; border-color: #55d7e8; }
+        QCheckBox::indicator:unchecked { image: none; }
+        #settingsDialog { background: #18182b; }
+        #dialogTitle { color: #f5f3ff; font-size: 22px; font-weight: 800; }
         """
 
 
 def main() -> int:
+    if "--ai-smoke-test" in sys.argv:
+        app = QCoreApplication(sys.argv[:1])
+        app.setApplicationName(APP_NAME)
+        app.setApplicationVersion(APP_VERSION)
+        app.setOrganizationName("Bottom Browser")
+        answers: list[str] = []
+        errors: list[str] = []
+        worker = AIRequestThread(
+            "Reply briefly to confirm that private local inference is running."
+        )
+        worker.progress.connect(lambda status: print(status, flush=True))
+        worker.completed.connect(answers.append)
+        worker.failed.connect(errors.append)
+        worker.run()
+        if errors or not answers:
+            print(errors[0] if errors else "Local AI returned no answer.", file=sys.stderr)
+            return 1
+        print(f"BOTTOM_AI_SMOKE_OK: {answers[0]}", flush=True)
+        return 0
     os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--enable-features=VaapiVideoDecoder")
     register_bottom_scheme()
     QApplication.setHighDpiScaleFactorRoundingPolicy(
@@ -921,7 +1314,7 @@ def main() -> int:
     app.setApplicationName(APP_NAME)
     app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName("Bottom Browser")
-    app.setWindowIcon(make_icon("app", 64))
+    app.setWindowIcon(application_icon())
     window = BrowserWindow()
     window.show()
     return app.exec()
