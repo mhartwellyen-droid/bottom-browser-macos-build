@@ -21,6 +21,20 @@ its own SQLite full-text search index. Tabs and navigation controls live at the
 - Zoom controls and full-screen mode
 - Modern dark interface and a custom new-tab screen
 - Private search history and controls to refresh, clear, or reset the index
+- Private on-device Bottom AI with no account or API key
+- Independent ad and tracker blocking, optional YouTube dislike counts, and
+  battery-saving tab freezing
+
+## Private Bottom AI
+
+Bottom AI runs on the downloader's Mac through `llama.cpp`; prompts and local
+search context are not sent to an AI provider. On first use, Bottom Browser
+automatically downloads the Apache-2.0-licensed SmolLM2 360M Instruct model
+(about 258 MiB), verifies its pinned SHA-256 digest, and stores it in the app
+data directory. Later requests work offline. Page text is given to the model
+only through the explicit **Share page text & summarize** action.
+
+Model and inference-engine attribution is in `THIRD_PARTY_NOTICES.md`.
 
 ## How Bottom Search works
 
@@ -59,8 +73,8 @@ The packaged app is written to `dist/BottomBrowser`. On Windows it contains
 `BottomBrowser.exe`. On macOS the script creates `BottomBrowser.app` and an
 architecture-specific DMG:
 
-- `BottomBrowser-2.0.0-macos-arm64.dmg` for Apple Silicon
-- `BottomBrowser-2.0.0-macos-x86_64.dmg` for Intel Macs
+- `BottomBrowser-3.0.0-macos-arm64.dmg` for Apple Silicon
+- `BottomBrowser-3.0.0-macos-x86_64.dmg` for Intel Macs
 
 The DMG contains the app and an Applications shortcut. Drag Bottom Browser into
 Applications. Unsigned local builds may require right-clicking the app and
@@ -96,4 +110,6 @@ SHA-256 checksums.
 - On Linux, the packaged app requires a graphical desktop session.
 - Browser profile data, Bottom Search history, and the local index are stored in
   `~/.bottom-browser`.
+- The private AI model is stored in Bottom Browser's standard macOS application
+  data directory and can be removed to reclaim about 258 MiB.
 - Apple Developer ID signing and notarization are intentionally not included.
