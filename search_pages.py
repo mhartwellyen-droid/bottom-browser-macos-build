@@ -241,6 +241,13 @@ def render_results(
       display: inline-block; margin-top: 10px; padding: 3px 7px; color: #737d92;
       background: #131720; border: 1px solid #222837; border-radius: 6px; font-size: 10px;
     }}
+    .ai-answer {{
+      margin: 0 0 27px; padding: 19px 21px; color: #c8cde0;
+      background: linear-gradient(135deg, #241d44, #153342);
+      border: 1px solid #4e4d83; border-radius: 16px; line-height: 1.6;
+    }}
+    .ai-answer strong {{ display:block; margin-bottom:7px; color:#83e0e7; }}
+    .ai-answer[data-error="true"] {{ color:#e8a9bd; border-color:#6a3b54; }}
     .empty {{ padding: 72px 30px; text-align: center; background: #11151e; border: 1px solid #232938; border-radius: 20px; }}
     .empty-icon {{ color: #8272ff; font-size: 52px; }}
     .empty h2 {{ color: #e7eaf2; }}
@@ -257,6 +264,10 @@ def render_results(
   </header>
   <main>
     <p class="summary">{escape(result_summary)}</p>
+    <section class="ai-answer" id="bottom-ai-answer">
+      <strong>Bottom AI</strong>
+      <span id="bottom-ai-text">Reading the local results…</span>
+    </section>
     {''.join(cards)}
   </main>
 </body>

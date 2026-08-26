@@ -34,6 +34,17 @@ def add_optional_resources(command: list[str]) -> None:
     corpus = ROOT / "starter_corpus.json"
     if corpus.is_file():
         command.extend(["--add-data", f"{corpus}{os.pathsep}."])
+    icon_source = ROOT / "assets" / "BottomBrowser.svg"
+    if icon_source.is_file():
+        command.extend(
+            ["--add-data", f"{icon_source}{os.pathsep}assets"]
+        )
+    notices = ROOT / "THIRD_PARTY_NOTICES.md"
+    if notices.is_file():
+        command.extend(["--add-data", f"{notices}{os.pathsep}."])
+    licenses = ROOT / "licenses"
+    if licenses.is_dir():
+        command.extend(["--add-data", f"{licenses}{os.pathsep}licenses"])
 
     if sys.platform == "darwin":
         icons = (ROOT / "assets" / "BottomBrowser.icns", ROOT / "BottomBrowser.icns")
@@ -110,6 +121,8 @@ def main() -> int:
         "--windowed",
         "--name",
         APP_NAME,
+        "--collect-all",
+        "llama_cpp",
     ]
     if sys.platform == "darwin":
         command.extend(

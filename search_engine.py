@@ -9,6 +9,7 @@ caller's/UI thread.  All functionality uses the Python standard library.
 """
 from __future__ import annotations
 
+import hashlib
 import html
 import ipaddress
 import json
@@ -35,6 +36,17 @@ BAD_EXTENSIONS = frozenset((".pdf", ".zip", ".gz", ".tar", ".jpg", ".jpeg", ".pn
     ".gif", ".webp", ".svg", ".mp3", ".mp4", ".avi", ".mov", ".exe", ".dmg",
     ".iso", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".woff", ".ttf"))
 TOKEN_RE = re.compile(r"[\w']+", re.UNICODE)
+# Query-only expansions.  These are deliberately small, transparent groups:
+# they improve common vocabulary mismatches without changing stored documents
+# or accepting user supplied FTS operators.
+QUERY_ALIASES: dict[str, tuple[str, ...]] = {
+    "heart": ("cardiac", "cardiovascular"),
+    "cardiac": ("heart", "cardiovascular"),
+    "weather": ("meteorology", "climate"),
+    "meteorology": ("weather",),
+    "python": ("py",),
+    "list": ("lists", "array", "sequence"),
+}
 
 __all__ = ["Crawler", "LocalSearchEngine", "SearchResult", "USER_AGENT", "normalize_url"]
 
@@ -133,6 +145,8 @@ class LocalSearchEngine:
             CREATE TABLE IF NOT EXISTS query_history (
               id INTEGER PRIMARY KEY, query TEXT NOT NULL, searched_at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS history_time ON query_history(searched_at DESC);
+            CREATE TABLE IF NOT EXISTS metadata (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
 
     def close(self) -> None:
@@ -161,33 +175,80 @@ class LocalSearchEngine:
     def seed_starter_corpus(self, path: str | Path | None = None) -> int:
         """Idempotently import bundled JSON corpus; return documents processed."""
         path = Path(path) if path else Path(__file__).with_name("starter_corpus.json")
-        entries = json.loads(path.read_text(encoding="utf-8"))
+        payload = path.read_bytes()
+        fingerprint = hashlib.sha256(payload).hexdigest()
+        with self._lock:
+            saved = self._db.execute(
+                "SELECT value FROM metadata WHERE key='starter_corpus_sha256'"
+            ).fetchone()
+            if saved and saved[0] == fingerprint:
+                return 0
+        entries = json.loads(payload)
         if not isinstance(entries, list): raise ValueError("starter corpus must be a JSON list")
+        now = _utcnow()
+        rows = []
         for item in entries:
-            self.upsert_document(item["url"], item["title"], item["text"],
-                description=item.get("description", ""), source=item.get("source", ""),
-                license=item.get("license", ""))
+            url = normalize_url(item["url"])
+            title = " ".join(str(item["title"]).split())[:1000]
+            text = " ".join(str(item["text"]).split())[:MAX_TEXT_CHARS]
+            if not title or not text:
+                continue
+            rows.append((
+                url, title,
+                " ".join(str(item.get("description", "")).split())[:2000],
+                text, _domain(url), str(item.get("source", "")),
+                str(item.get("license", "")), now, now,
+            ))
+        with self._lock, self._db:
+            self._db.executemany("""INSERT INTO documents
+              (url,title,description,text,domain,source,license,indexed_at,updated_at)
+              VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(url) DO UPDATE SET title=excluded.title,
+              description=excluded.description,text=excluded.text,
+              domain=excluded.domain,source=excluded.source,
+              license=excluded.license,updated_at=excluded.updated_at""", rows)
+            self._db.execute(
+                """INSERT INTO metadata(key,value) VALUES('starter_corpus_sha256',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (fingerprint,),
+            )
         return len(entries)
 
     def search(self, query: str, limit: int = 10, *, record_history: bool = True) -> list[SearchResult]:
         """Search with BM25, freshness and diversity.
 
-        All terms are required first.  If that produces no documents, a safe
-        OR/prefix query is used so partially typed and broad multi-word
-        searches remain useful.  Only tokens extracted by :data:`TOKEN_RE`
-        enter FTS syntax, so user input cannot alter the query grammar.
+        All term groups (including a small set of query aliases) are required
+        first. If that produces no documents, terms of three or more
+        characters may use a safe prefix fallback for type-ahead discovery.
+        In particular, ``hi`` never becomes ``hi*`` and therefore cannot
+        accidentally find ``History``. Only tokens extracted by
+        :data:`TOKEN_RE` enter FTS syntax, so user input cannot alter the FTS
+        query grammar.
         """
         terms = TOKEN_RE.findall(query.lower())
         if not terms: return []
         limit = max(1, min(int(limit), 100))
+        phrase = " ".join(terms)
         with self._lock:
             if record_history:
                 with self._db: self._db.execute("INSERT INTO query_history(query,searched_at) VALUES (?,?)", (query.strip()[:500], _utcnow()))
-            rows = self._fts_rows(" ".join(f'"{term}"' for term in terms), limit)
-            if not rows:
+            exact_match = self._expanded_match(terms)
+            rows = self._fts_rows(exact_match, limit)
+            exact_title_rows = self._db.execute(
+                """SELECT d.*, 0.0 AS rank FROM documents d
+                WHERE lower(d.title)=? LIMIT ?""",
+                (phrase, limit),
+            ).fetchall()
+            if exact_title_rows:
+                exact_ids = {row["id"] for row in exact_title_rows}
+                rows = exact_title_rows + [
+                    row for row in rows if row["id"] not in exact_ids
+                ]
+            prefix_terms = [term for term in terms if len(term) >= 3]
+            if not rows and prefix_terms:
                 # Prefix terms intentionally improve first-run discovery (for
                 # example, "astron phy" can find astronomy and physics).
-                fallback = " OR ".join(f'"{term}"*' for term in terms)
+                fallback = " OR ".join(f'"{term}"*' for term in prefix_terms)
                 rows = self._fts_rows(fallback, limit)
         seen: dict[str, int] = {}
         results = []
@@ -197,12 +258,33 @@ class LocalSearchEngine:
             try: age = max(0, (now - datetime.fromisoformat(row["updated_at"])).days)
             except ValueError: pass
             count = seen.get(row["domain"], 0); seen[row["domain"]] = count + 1
-            # FTS bm25 is negative (more negative is better).
-            score = -float(row["rank"]) + .25 / (1 + age / 30) - .18 * count
+            # FTS bm25 is negative (more negative is better).  Exact titles
+            # and title phrases are intentional-navigation signals and should
+            # dominate broad corpus matches.
+            title = " ".join(TOKEN_RE.findall(row["title"].lower()))
+            title_bonus = 0.0
+            if title == phrase:
+                title_bonus = 1000.0
+            elif phrase and phrase in title:
+                title_bonus = 100.0
+            elif phrase and phrase in row["description"].lower():
+                title_bonus = 15.0
+            score = -float(row["rank"]) + title_bonus + .25 / (1 + age / 30) - .18 * count
             results.append(SearchResult(row["url"], row["title"], self._snippet(row["text"], terms),
                                         score, row["domain"], row["description"], row["source"],
                                         row["license"], row["updated_at"]))
         return sorted(results, key=lambda r: r.score, reverse=True)[:limit]
+
+    @staticmethod
+    def _expanded_match(terms: list[str]) -> str:
+        """Build an AND query from fixed, safely quoted token alternatives."""
+        groups = []
+        for term in terms:
+            alternatives = (term,) + QUERY_ALIASES.get(term, ())
+            # Alternatives are module constants or TOKEN_RE tokens, but quote
+            # each one anyway so this remains a closed FTS grammar.
+            groups.append("(" + " OR ".join(f'"{value}"' for value in alternatives) + ")")
+        return " AND ".join(groups)
 
     def _fts_rows(self, match: str, limit: int) -> list[sqlite3.Row]:
         return self._db.execute("""SELECT d.*, bm25(document_fts, 8.0, 3.0, 1.0) AS rank
@@ -227,7 +309,11 @@ class LocalSearchEngine:
     def clear_history(self) -> None:
         with self._lock, self._db: self._db.execute("DELETE FROM query_history")
     def clear_index(self) -> None:
-        with self._lock, self._db: self._db.execute("DELETE FROM documents")
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM documents")
+            self._db.execute(
+                "DELETE FROM metadata WHERE key='starter_corpus_sha256'"
+            )
     def stats(self) -> dict[str, Any]:
         with self._lock:
             return {"documents": self._db.execute("SELECT count(*) FROM documents").fetchone()[0],
