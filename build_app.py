@@ -161,14 +161,7 @@ def main() -> int:
     if sys.platform == "darwin":
         output = ROOT / "dist" / f"{APP_NAME}.app"
         update_macos_bundle_metadata(output, version)
-        dmg = create_macos_dmg(output, version)
-        if os.environ.get("BOTTOM_BROWSER_EMBED_DMG") == "1":
-            # Some generic CI templates only upload the .app bundle. Keeping a
-            # copy inside Resources lets that bundle carry the real DMG out of
-            # the runner without changing the template-owned workflow.
-            shutil.copy2(dmg, output / "Contents" / "Resources" / dmg.name)
         sign_macos_bundle(output)
-        # Rebuild after signing so the distributed DMG contains the signed app.
         dmg = create_macos_dmg(output, version)
         print(f"DMG complete: {dmg}")
     elif sys.platform == "win32":
