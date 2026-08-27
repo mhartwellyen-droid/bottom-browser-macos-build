@@ -1,0 +1,28 @@
+{
+  "filename": "BottomBrowser-3.0.2-macos-x86_64.dmg",
+  "architecture": "x86_64",
+  "bytes": 232566313,
+  "sha256": "c7cb55532bbde77be49092d5fa8929525e6e7f0d1559510621866d4b19197ae2",
+  "chunks": [
+    {
+      "name": "BottomBrowser-3.0.2-macos-x86_64.dmg.part-001",
+      "bytes": 47185920
+    },
+    {
+      "name": "BottomBrowser-3.0.2-macos-x86_64.dmg.part-002",
+      "bytes": 47185920
+    },
+    {
+      "name": "BottomBrowser-3.0.2-macos-x86_64.dmg.part-003",
+      "bytes": 47185920
+    },
+    {
+      "name": "BottomBrowser-3.0.2-macos-x86_64.dmg.part-004",
+      "bytes": 47185920
+    },
+    {
+      "name": "BottomBrowser-3.0.2-macos-x86_64.dmg.part-005",
+      "bytes": 43822633
+    }
+  ]
+}
