@@ -73,8 +73,8 @@ The packaged app is written to `dist/BottomBrowser`. On Windows it contains
 `BottomBrowser.exe`. On macOS the script creates `BottomBrowser.app` and an
 architecture-specific DMG:
 
-- `BottomBrowser-3.0.1-macos-arm64.dmg` for Apple Silicon
-- `BottomBrowser-3.0.1-macos-x86_64.dmg` for Intel Macs
+- `BottomBrowser-3.0.2-macos-arm64.dmg` for Apple Silicon
+- `BottomBrowser-3.0.2-macos-x86_64.dmg` for Intel Macs
 
 The DMG contains the app and an Applications shortcut. Drag Bottom Browser into
 Applications. Unsigned local builds may require right-clicking the app and
