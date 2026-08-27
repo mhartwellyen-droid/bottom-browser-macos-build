@@ -107,6 +107,22 @@ def create_macos_dmg(app_bundle: Path, version: str) -> Path:
     return dmg
 
 
+def sign_macos_bundle(app_bundle: Path) -> None:
+    """Give unsigned distribution builds a valid local code signature."""
+    subprocess.run(
+        [
+            "codesign",
+            "--force",
+            "--deep",
+            "--sign",
+            "-",
+            "--timestamp=none",
+            str(app_bundle),
+        ],
+        check=True,
+    )
+
+
 def main() -> int:
     version = project_version()
     for folder in ("build", "dist"):
@@ -151,6 +167,9 @@ def main() -> int:
             # copy inside Resources lets that bundle carry the real DMG out of
             # the runner without changing the template-owned workflow.
             shutil.copy2(dmg, output / "Contents" / "Resources" / dmg.name)
+        sign_macos_bundle(output)
+        # Rebuild after signing so the distributed DMG contains the signed app.
+        dmg = create_macos_dmg(output, version)
         print(f"DMG complete: {dmg}")
     elif sys.platform == "win32":
         output = output / f"{APP_NAME}.exe"
