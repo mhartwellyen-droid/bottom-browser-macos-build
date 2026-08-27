@@ -1,6 +1,6 @@
 [project]
 name = "bottom-browser"
-version = "3.0.0"
+version = "3.0.1"
 description = "A private AI-powered PyQt browser with independent local search and bottom-mounted controls"
 requires-python = ">=3.12"
 dependencies = [
