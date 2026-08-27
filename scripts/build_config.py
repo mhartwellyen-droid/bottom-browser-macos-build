@@ -104,7 +104,7 @@ def build_outputs(cfg: dict) -> dict[str, str]:
     # --windowed always produces a .app bundle on macOS, in both
     # onefile and onedir mode. Windows gets an .exe or a folder.
     windows_target = f"dist/{name}.exe" if onefile else f"dist/{name}"
-    macos_target = f"dist/{name}.app" if windowed else f"dist/{name}"
+    macos_target = "dist" if windowed else f"dist/{name}"
 
     # ---- which runners to spin up ----------------------------------
     targets = build.get("targets", list(VALID_TARGETS)[:3])
